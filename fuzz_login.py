@@ -45,7 +45,6 @@ if __name__ == "__main__":
         print(f"  [!] SQLi found: {v['payload']} → HTTP {v['status_code']}")
     
     if vulnerable:
-        # Это сработает в GitHub Actions как ошибка пайплайна
         print("::error::SQL Injection detected in /rest/user/login")
         sys.exit(1)
     else:
