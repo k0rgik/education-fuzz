@@ -1,8 +1,10 @@
+
 name: Fuzzing
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,38 +16,59 @@ jobs:
   ffuf:
     runs-on: ubuntu-latest
     services:
-        juice:
-          image: bkimminich/juice-shop
-          ports:
-            - 3000:3000
+      juice:
+        image: bkimminich/juice-shop
+        ports:
+          - 3000:3000
     steps:
       - name: Wait for service
         run: |
-            sleep 10 
-            curl --path-as-is -i -s -k -X $'POST' \
-              -H $'Host: localhost:3000' -H $'Content-Length: 43' -H $'Content-Type: application/json' -H $'Connection: keep-alive' \
-              --data-binary $'{\"email\":\"\' or 1=1 -- -\",\"password\":\"pass\"}' \
-              $'http://localhost:3000/rest/user/login'
+          echo "Waiting for Juice Shop..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/rest/products > /dev/null 2>&1; then
+              echo "Juice Shop is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Juice Shop failed to start"
+          exit 1
 
       - name: Get payloads
         run: |
-          wget https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection
-      
-      - name: Install fuzzing
+          wget -O sqli-payloads.txt \
+            https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection
+          echo "Payloads: $(wc -l < sqli-payloads.txt) lines"
+
+      - name: Install ffuf
         run: |
           go install github.com/ffuf/ffuf/v2@latest
 
       - name: Run fuzzing
         run: |
-          $HOME/go/bin/ffuf || true
+          $HOME/go/bin/ffuf -w sqli-payloads.txt \
+            -d '{"email":"FUZZ","password":"anothervalue"}' \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -u http://localhost:3000/rest/user/login \
+            -mc 200 \
+            -mr "authentication" \
+            -o ffuf-result.json \
+            -of json \
+            -debug-log ffuf-debug.log
 
       - name: Get Logs from Service
+        if: always()
         run: |
           docker logs $(docker ps -q) > juice-logs.log
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-reports-bundle
           path: |
+            ffuf-result.json
+            ffuf-debug.log
             juice-logs.log
+            sqli-payloads.txt
